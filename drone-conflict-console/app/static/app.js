@@ -13,6 +13,7 @@ const state = {
   pairConstraints: [],
   earliestConflicts: [],
   solution: null,
+  priorSolution: null,   // {result, safety_radius, safety_height, pair_constraints}: old verified table kept after an unknown re-solve
   history: [],
   locks: {},             // sortieId -> offset (only when checked)
   time: 0,
@@ -78,6 +79,9 @@ function loadScenarioDto(dto) {
   state.pairConstraints = dto.pair_constraints || [];
   state.earliestConflicts = dto.earliest_conflicts || [];
   state.solution = dto.solution || null;
+  // GET/import responses never carry prior_solution: loading a scenario shows
+  // its stored (verified) plan as the plain current solution.
+  state.priorSolution = dto.prior_solution || null;
   state.locks = {};
   state.colorsById = {};
   state.batch = null;
@@ -108,11 +112,12 @@ async function fetchHistory() {
 }
 
 async function solve(extraLocks) {
+  const submittedLocks = extraLocks !== undefined ? extraLocks : collectLocks();
   const body = {
     safety_radius: parseFloat($("safetyRadius").value),
     safety_height: parseFloat($("safetyHeight").value),
     time_limit: parseFloat($("timeLimit").value) || 20,
-    locks: extraLocks !== undefined ? extraLocks : collectLocks(),
+    locks: submittedLocks,
   };
   try {
     const dto = await api(`/api/scenarios/${state.scenarioId}/solve`, {
@@ -120,11 +125,18 @@ async function solve(extraLocks) {
       body: JSON.stringify(body),
     });
     loadScenarioDto(dto);
+    // Keep THIS attempt's locks and thresholds on the page: the response
+    // describes the new constraints even when the proof returned unknown.
+    state.locks = Object.fromEntries(submittedLocks.map((l) => [l.sortie_id, l.offset]));
     state.history = await fetchHistory();
     renderAll();
     if (dto.solution.feasible) toast("求解成功，已生成无冲突起飞时刻");
     else if (dto.solution.status === "unknown") {
-      toast("求解超时：暂未找到可行表，也未证明无解；已有方案保持不变", 4200);
+      if (dto.prior_solution) {
+        toast("求解超时：新锁定/阈值未经验证；旧可行表仍保留可查看，建批次需显式选用旧表", 5200);
+      } else {
+        toast("求解超时：暂未找到可行表，也未证明无解；暂无保留的旧方案", 4200);
+      }
     } else toast("当前条件无解，已列出极小无解架次集合", 4000);
   } catch (e) {
     toast("求解失败：" + e.message, 4200);
@@ -133,6 +145,25 @@ async function solve(extraLocks) {
 
 function collectLocks() {
   return Object.entries(state.locks).map(([sortie_id, offset]) => ({ sortie_id, offset }));
+}
+
+// After an unknown re-solve the freshly solved table does not exist, but the
+// previously verified table is still viewable as a dashed "旧表" track.
+function viewablePlan() {
+  if (state.solution && state.solution.feasible) return { result: state.solution, isPrior: false };
+  if (state.priorSolution && state.priorSolution.result && state.priorSolution.result.feasible) {
+    return { result: state.priorSolution.result, isPrior: true };
+  }
+  return null;
+}
+
+function planOffsets() {
+  const plan = viewablePlan();
+  const o = {};
+  for (const s of state.sorties) {
+    o[s.id] = plan ? (plan.result.offsets[s.id] ?? 0) : 0;
+  }
+  return { offsets: o, isPrior: plan ? plan.isPrior : false };
 }
 
 // ---------------------------------------------------------------------------
@@ -179,11 +210,7 @@ function updateMaxTime() {
 }
 
 function currentOffsets() {
-  const o = {};
-  for (const s of state.sorties) {
-    o[s.id] = state.solution && state.solution.feasible ? (state.solution.offsets[s.id] ?? 0) : 0;
-  }
-  return o;
+  return planOffsets().offsets;
 }
 
 // ---------------------------------------------------------------------------
@@ -193,7 +220,9 @@ function currentOffsets() {
 function renderSortiePanel() {
   const box = $("sortiesList");
   box.innerHTML = "";
-  const solvedOff = state.solution && state.solution.feasible ? state.solution.offsets : null;
+  const plan = viewablePlan();
+  const solvedOff = plan ? plan.result.offsets : null;
+  const offTag = plan && plan.isPrior ? "旧表" : "求解";
   for (const s of state.sorties) {
     const c = colorFor(s.id);
     const div = document.createElement("div");
@@ -207,7 +236,7 @@ function renderSortiePanel() {
         <span class="si-meta">w=${s.weight} · 窗[0,${s.window_hi}] · 长${s.flight_end}s</span>
       </div>
       <div class="si-body">
-        <span class="${solvedOff ? "solved-tag" : ""}">求解偏移: <b>${solvedOff ? solvedOff[s.id] : "—"}</b></span>
+        <span class="${solvedOff ? "solved-tag" : ""}">${offTag}偏移: <b>${solvedOff ? solvedOff[s.id] : "—"}</b></span>
         <label class="lock-wrap">
           <input type="checkbox" ${locked ? "checked" : ""} data-lock-check="${s.id}" />
           锁定
@@ -283,12 +312,41 @@ function renderResultPanel() {
   panel.classList.remove("hidden");
   if (sol.status === "unknown") {
     title.textContent = "⏳ 求解超时 — 可行与无解均未证明";
-    body.innerHTML = `
-      <div class="kv bad"><span>状态</span><b>${sol.status}</b></div>
+    const R = state.scenario.safety_radius, H = state.scenario.safety_height;
+    const lockTxt = Object.entries(sol.locked || {}).length
+      ? Object.entries(sol.locked).sort().map(([k, v]) => `${escapeHtml(k)}=${v}`).join("，")
+      : "（无）";
+    let html = `
+      <div class="kv bad"><span>本次状态</span><b>${sol.status}</b></div>
+      <div class="kv"><span>本次安全阈值</span><b>R=${R}m / H=${H}m</b></div>
+      <div class="kv"><span>本次锁定</span><b>${lockTxt}</b></div>
       <div class="hint" style="margin-top:6px">
         在给定时限内 CP-SAT 既没有找到可行起飞表，也没有证明无解。这与“确实无解”不同：
-        可加大求解时限后重试。若此前已保存过可行方案，该方案仍保留在 SQLite 中，
-        已建执行批次不受影响。</div>`;
+        可加大求解时限后重试。本次锁定与阈值已保留在页面并送进了冲突约束/求解器，
+        但它们<strong>尚未经验证</strong>，不会覆盖任何已有结果。</div>`;
+    const prior = state.priorSolution;
+    if (prior) {
+      const seq = Object.keys(prior.result.offsets).sort()
+        .map((k) => `${escapeHtml(k)}=${prior.result.offsets[k]}`).join("，");
+      html += `
+      <div class="core-box" style="border-color:var(--ok);margin-top:8px">
+        <div class="kv ok"><span>旧可行表（原约束，仍可查看）</span><b>${prior.result.status}</b></div>
+        <div class="kv"><span>旧表原阈值</span><b>R=${prior.safety_radius}m / H=${prior.safety_height}m</b></div>
+        <div class="hint" style="margin-top:4px">起飞时刻（相对最早起飞，秒）：${seq}</div>
+        <div class="hint">该表仅在上述<strong>原阈值</strong>下被验证为无冲突；它不是本次新约束
+          （R=${R}m / H=${H}m，锁定 ${lockTxt}）下的解。地图/时间轴以虚线“旧表”轨迹保留显示，
+          已建执行批次不受影响。</div>
+        <div style="margin-top:6px">
+          <button id="usePriorBatchBtn" type="button">显式选用旧表（原阈值 R=${prior.safety_radius}m / H=${prior.safety_height}m）创建批次</button>
+        </div>
+      </div>`;
+    } else {
+      html += `<div class="hint" style="margin-top:6px">SQLite 中没有已验证的旧可行表，
+        因此当前没有可显示的旧方案；新可行解或确证无解后会照常落库。</div>`;
+    }
+    body.innerHTML = html;
+    const btn = $("usePriorBatchBtn");
+    if (btn) btn.addEventListener("click", createBatchFromPrior);
   } else if (!sol.feasible) {
     title.textContent = "⚠️ 无解 — 极小无解架次集合";
     let html = `<div class="kv bad"><span>状态</span><b>${sol.status}</b></div>`;
@@ -386,13 +444,15 @@ function niceStep(raw) {
   return 10 * p;
 }
 
-function drawTrack(ctx, proj, s, takeoff, dashed, time) {
+function drawTrack(ctx, proj, s, takeoff, dashed, time, opts = {}) {
   const c = colorFor(s.id);
+  const alpha = opts.alpha !== undefined ? opts.alpha : (dashed ? 0.5 : 1);
+  const labelSuffix = opts.labelSuffix || "";
   ctx.save();
   ctx.strokeStyle = c;
   ctx.lineWidth = 2;
   ctx.setLineDash(dashed ? [6, 5] : []);
-  ctx.globalAlpha = dashed ? 0.5 : 1;
+  ctx.globalAlpha = alpha;
   ctx.beginPath();
   s.waypoints.forEach((p, i) => {
     const [px, py] = proj.xy(p.x, p.y);
@@ -410,7 +470,7 @@ function drawTrack(ctx, proj, s, takeoff, dashed, time) {
   const [lx, ly] = proj.xy(p0.x, p0.y);
   ctx.fillStyle = c;
   ctx.font = "11px sans-serif";
-  ctx.fillText(`${s.id}${takeoff ? " +" + takeoff + "s" : ""}`, lx + 4, ly - 5);
+  ctx.fillText(`${s.id}${takeoff ? " +" + takeoff + "s" : ""}${labelSuffix}`, lx + 4, ly - 5);
   // moving aircraft marker
   const pos = positionAt(s, takeoff, time);
   if (pos) {
@@ -464,13 +524,25 @@ function renderMap() {
 
   const showE = $("showEarliest").checked;
   const showS = $("showSolved").checked;
-  const solvedOff = state.solution && state.solution.feasible ? state.solution.offsets : null;
+  const po = planOffsets();
+  const solvedOff = po.offsets;
+  const isPrior = po.isPrior;
 
   for (const s of state.sorties) {
     if (showE) drawTrack(ctx, proj, s, 0, true, state.time);
   }
-  for (const s of state.sorties) {
-    if (showS && solvedOff) drawTrack(ctx, proj, s, solvedOff[s.id] || 0, false, state.time);
+  if (viewablePlan()) {
+    for (const s of state.sorties) {
+      if (!showS) continue;
+      // A retained old table (after an unknown re-solve) is drawn dashed and
+      // labelled 旧表: it is only proven under its original thresholds.
+      if (isPrior) {
+        drawTrack(ctx, proj, s, solvedOff[s.id] || 0, true, state.time,
+                  { alpha: 0.8, labelSuffix: " 旧表" });
+      } else {
+        drawTrack(ctx, proj, s, solvedOff[s.id] || 0, false, state.time);
+      }
+    }
   }
   drawSafetyRadius(ctx, proj, state.earliestConflicts, state.scenario.safety_radius);
   drawConflictMarkers(ctx, proj, state.earliestConflicts);
@@ -495,7 +567,9 @@ function renderTimeline() {
   ctx.clearRect(0, 0, w, h);
   if (!state.sorties.length) return;
   const g = timelineGeometry(w, h);
-  const solvedOff = state.solution && state.solution.feasible ? state.solution.offsets : null;
+  const po = planOffsets();
+  const solvedOff = viewablePlan() ? po.offsets : null;
+  const isPrior = po.isPrior;
 
   // grid + axis
   ctx.strokeStyle = "#243049"; ctx.fillStyle = "#8092b5"; ctx.font = "10px monospace";
@@ -519,12 +593,12 @@ function renderTimeline() {
       drawBar(ctx, tToX(0, g), yc - barH / 2, tToX(s.flight_end, g) - tToX(0, g), barH,
               colorFor(s.id), true, 0.45);
     }
-    // solved bar
+    // solved bar (dashed + 旧表 for a retained old table after unknown)
     if (solvedOff && $("showSolved").checked) {
       const t0 = solvedOff[s.id] || 0;
       drawBar(ctx, tToX(t0, g), yc - barH / 2,
               tToX(t0 + s.flight_end, g) - tToX(t0, g), barH,
-              colorFor(s.id), false, 0.92);
+              colorFor(s.id), isPrior, isPrior ? 0.8 : 0.92);
     }
 
     // conflict ticks on earliest schedule
@@ -588,14 +662,15 @@ function renderProfile() {
     ctx.fillText(`${z}m`, 6, y + 3);
   }
 
-  const solvedOff = state.solution && state.solution.feasible ? state.solution.offsets : null;
+  const solvedPlan = viewablePlan();
+  const solvedOff = solvedPlan ? solvedPlan.result.offsets : null;
   for (const s of state.sorties) {
     const c = colorFor(s.id);
     if ($("showEarliest").checked) {
       drawProfileLine(ctx, s, 0, g, c, zy, true);
     }
     if (solvedOff && $("showSolved").checked) {
-      drawProfileLine(ctx, s, solvedOff[s.id] || 0, g, c, zy, false);
+      drawProfileLine(ctx, s, solvedOff[s.id] || 0, g, c, zy, solvedPlan.isPrior);
     }
   }
 }
@@ -636,6 +711,12 @@ function renderLegend() {
   cf.className = "lg";
   cf.innerHTML = `<span style="color:#ff5d6c">✕</span> 冲突见证点（最早起飞）`;
   box.appendChild(cf);
+  if (viewablePlan() && viewablePlan().isPrior) {
+    const old = document.createElement("span");
+    old.className = "lg";
+    old.innerHTML = `<span style="color:#38d39f">╌</span> 旧表轨迹（原阈值，本次未验证）`;
+    box.appendChild(old);
+  }
 }
 
 function renderAll() {
@@ -679,18 +760,58 @@ function nextRevision(sortieId) {
 
 async function createBatch() {
   if (!state.scenarioId) return;
+  // After an unknown re-solve the normal entry must not silently freeze the
+  // retained old table against the new, unverified constraints.
+  if (state.solution && state.solution.status === "unknown") {
+    if (state.priorSolution) {
+      toast("本次求解未验证：请在结果面板显式选用旧表及原阈值来创建批次", 4600);
+      return;
+    }
+    toast("暂无已验证的可行方案，不能创建执行批次", 4200);
+    return;
+  }
   const name = prompt("为执行批次命名（可留空）：", `批次 #${state.scenarioId}`);
   if (name === null) return;
   try {
     const b = await api(`/api/scenarios/${state.scenarioId}/batches`, {
       method: "POST",
-      body: JSON.stringify({ name }),
+      body: JSON.stringify({ name, plan_source: "current" }),
     });
     toast("已创建执行批次（输入航迹 / 安全阈值 / 计划偏移已冻结）");
     await fetchBatches();
     await openBatch(b.batch_id);
   } catch (e) {
     toast("创建批次失败：" + e.message, 4000);
+  }
+}
+
+// Explicitly freeze the PREVIOUSLY VERIFIED table after an unknown re-solve:
+// the request echoes the old table's original thresholds so the server rejects
+// any mismatch with what is actually stored.
+async function createBatchFromPrior() {
+  if (!state.scenarioId || !state.priorSolution) return;
+  const prior = state.priorSolution;
+  const ok = confirm(
+    `将显式选用旧可行表创建执行批次，并冻结其原安全阈值 R=${prior.safety_radius}m / ` +
+    `H=${prior.safety_height}m（而非本次未验证的阈值）。是否继续？`);
+  if (!ok) return;
+  const name = prompt("为执行批次命名（可留空）：", `旧表批次 #${state.scenarioId}`);
+  if (name === null) return;
+  try {
+    const b = await api(`/api/scenarios/${state.scenarioId}/batches`, {
+      method: "POST",
+      body: JSON.stringify({
+        name,
+        plan_source: "stored",
+        stored_safety_radius: prior.safety_radius,
+        stored_safety_height: prior.safety_height,
+      }),
+    });
+    toast("已按旧表及原阈值冻结执行批次（本次未验证的锁定/阈值未参与）", 4600);
+    await fetchBatches();
+    await openBatch(b.batch_id);
+  } catch (e) {
+    toast("选用旧表创建批次失败：" + e.message, 4600);
   }
 }
 

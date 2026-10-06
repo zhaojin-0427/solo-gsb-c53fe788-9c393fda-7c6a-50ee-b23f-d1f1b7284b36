@@ -64,7 +64,8 @@ def _pair_constraints_dto(pcs: list[PairConstraint]) -> list[dict]:
 
 
 def _scenario_summary(sid: int, sorties, safety_radius, safety_height,
-                      pcs, solve_result=None, earliest_conflicts=None) -> dict:
+                      pcs, solve_result=None, earliest_conflicts=None,
+                      prior_solution="UNSET") -> dict:
     out = {
         "scenario_id": sid,
         "safety_radius": safety_radius,
@@ -87,6 +88,10 @@ def _scenario_summary(sid: int, sorties, safety_radius, safety_height,
     }
     if solve_result is not None:
         out["solution"] = solve_result
+    # Only the solve route supplies this argument; GET/import responses keep
+    # their exact original shape for compatibility.
+    if prior_solution != "UNSET":
+        out["prior_solution"] = prior_solution
     return out
 
 
@@ -157,19 +162,14 @@ def solve_scenario(sid: int, req: SolveRequest):
             )
         locks[lk.sortie_id] = lk.offset
 
+    # The just-attempted locks/thresholds always drive the conflict table and
+    # the solver, and are echoed back whether or not the proof finishes.
     pcs = build_pair_constraints(sorties, R, H)
     res = run_solve(sorties, pcs, locks, time_limit=req.time_limit)
 
-    # A time-out that proved nothing must never destroy a previously proven
-    # feasible take-off table in SQLite: the re-solve response falls back to
-    # the stored plan (and its thresholds), batches created from it stay valid.
-    # A genuine infeasibility proof still replaces the stored result, and "no
-    # prior solution" leaves the unknown status visible to the page/API.
     prior = row.get("result")
-    keep_prior = res.status == "unknown" and bool(prior and prior.get("feasible"))
-    if keep_prior:
-        R, H = row["safety_radius"], row["safety_height"]
-        pcs = build_pair_constraints(sorties, R, H)
+    prior_feasible = bool(prior and prior.get("feasible"))
+    prior_block = None
 
     earliest = scan_schedule(sorties, {s.id: 0 for s in sorties}, R, H)
     solved_conflicts = []
@@ -178,25 +178,49 @@ def solve_scenario(sid: int, req: SolveRequest):
         if solved_conflicts:
             raise HTTPException(500, "internal error: solved schedule still conflicts")
 
-    result = {
+    if res.status == "unknown":
+        # The re-solve proved NOTHING under the new constraints, so the stored
+        # row is neither overwritten nor quietly served as "this" solution: the
+        # response stays unknown (solution) while the previously verified table
+        # is exposed separately, still viewable, with the thresholds under
+        # which it was actually proven.  With no prior table, unknown is simply
+        # visible with no retained plan.
+        if prior_feasible:
+            prior_pcs = build_pair_constraints(
+                sorties, row["safety_radius"], row["safety_height"])
+            prior_block = {
+                "result": prior,
+                "safety_radius": row["safety_radius"],
+                "safety_height": row["safety_height"],
+                "pair_constraints": _pair_constraints_dto(prior_pcs),
+            }
+    else:
+        # A proven infeasibility or a new feasible witness replaces the stored
+        # result exactly as before (feasible/infeasible rows are always saved).
+        store.save_result(sid, _result_dict(res, solved_conflicts), R, H)
+
+    result = _result_dict(res, solved_conflicts)
+    # prior_solution is part of the response ONLY for an unknown re-solve;
+    # ordinary successful/failed solves keep their exact historical fields.
+    prior_arg = prior_block if res.status == "unknown" else "UNSET"
+    return _scenario_summary(sid, sorties, R, H, pcs,
+                             solve_result=result,
+                             earliest_conflicts=earliest,
+                             prior_solution=prior_arg)
+
+
+def _result_dict(res, solved_conflicts: list | None = None) -> dict:
+    return {
         "feasible": res.feasible,
         "status": res.status,
         "weighted_delay": res.weighted_delay,
         "offsets": res.offsets,
         "locked": res.locked,
         "elapsed_seconds": round(res.elapsed_seconds, 4),
-        "solved_conflicts": solved_conflicts,
+        "solved_conflicts": solved_conflicts or [],
         "cores": res.cores,
         "truncated": res.truncated,
     }
-    if keep_prior:
-        effective_result = prior
-    else:
-        store.save_result(sid, result, R, H)
-        effective_result = result
-    return _scenario_summary(sid, sorties, R, H, pcs,
-                             solve_result=effective_result,
-                             earliest_conflicts=earliest)
 
 
 @app.post("/api/scenarios/{sid}/save")
@@ -246,15 +270,46 @@ def create_batch(sid: int, req: CreateBatchRequest):
     row = store.get_scenario(sid)
     if row is None:
         raise HTTPException(404, "scenario not found")
-    result = row["result"]
-    if result is None or not result.get("feasible"):
+    if req.plan_source not in ("current", "stored"):
         raise HTTPException(
-            400, "a feasible plan must be solved before creating an execution batch")
+            400, "plan_source must be 'current' or 'stored'")
+    if req.plan_source == "stored":
+        # Explicitly freeze the PREVIOUSLY VERIFIED table that survived an
+        # unverified (unknown) re-solve.  The client must echo the old table's
+        # original thresholds, so a batch can never silently freeze a plan
+        # under constraints the caller mistook for the just-attempted ones.
+        result = row["result"]
+        if result is None or not result.get("feasible"):
+            raise HTTPException(
+                400, "no previously verified feasible plan is stored; "
+                     "a feasible plan must be solved before creating an execution batch")
+        if req.stored_safety_radius is None or req.stored_safety_height is None:
+            raise HTTPException(
+                400,
+                "plan_source=stored requires stored_safety_radius and "
+                "stored_safety_height echoing the old plan's original thresholds")
+        if (float(req.stored_safety_radius) != float(row["safety_radius"])
+                or float(req.stored_safety_height) != float(row["safety_height"])):
+            raise HTTPException(400, detail={
+                "reason": "stored_threshold_mismatch",
+                "submitted_safety_radius": req.stored_safety_radius,
+                "submitted_safety_height": req.stored_safety_height,
+                "stored_safety_radius": row["safety_radius"],
+                "stored_safety_height": row["safety_height"],
+            })
+        plan_R, plan_H = row["safety_radius"], row["safety_height"]
+    else:
+        # Default behaviour, unchanged for existing clients: freeze the plan of
+        # the most recent verified solve held on the scenario row.
+        result = row["result"]
+        if result is None or not result.get("feasible"):
+            raise HTTPException(
+                400, "a feasible plan must be solved before creating an execution batch")
+        plan_R, plan_H = row["safety_radius"], row["safety_height"]
     # Freeze the input snapshot, safety thresholds and planned offsets; later
     # re-solves of the scenario never mutate this batch.
     plan = {"offsets": dict(result["offsets"])}
-    bid = store.create_batch(
-        sid, req.name, row["input"], row["safety_radius"], row["safety_height"], plan)
+    bid = store.create_batch(sid, req.name, row["input"], plan_R, plan_H, plan)
     batch = store.get_batch(bid)
     return _batch_summary(batch)
 

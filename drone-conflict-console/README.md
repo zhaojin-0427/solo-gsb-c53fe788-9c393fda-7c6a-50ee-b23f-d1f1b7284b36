@@ -39,8 +39,13 @@
 - **无解诊断**：无解时列出若干**包含关系极小**的无解架次集合（删去其中任意一架次，
   其余架次即可消解），并给出每对架次的**互斥时差**（后者起飞 − 前者起飞，秒）。
 - **锁定重算**：在页面勾选锁定并填写某些架次的整数秒偏移，重新求解其余架次。
-- **执行批次与偏差预警**：从已保存的可行方案创建**执行批次**，冻结输入航迹快照、
-  安全阈值与计划偏移；之后对原场景如何重算都不会改变批次。各架次以**非负整数秒
+- **执行批次与偏差预警**：从已验证的可行方案创建**执行批次**，冻结输入航迹快照、
+  安全阈值与计划偏移；之后对原场景如何重算都不会改变批次。重算返回 `unknown`
+  （新锁定/阈值未经验证）而 SQLite 中仍有旧可行表时，**不能**从普通批次入口直接
+  冻结旧约束：页面结果面板提供 **“显式选用旧表（原阈值）创建批次”** 入口，请求带
+  `plan_source="stored"` 并**回显旧表原阈值**（`stored_safety_radius` /
+  `stored_safety_height`），阈值与库存不一致或缺失回显一律 `400` 拒绝；不传
+  `plan_source`（默认 `current`）的既有请求行为不变。各架次以**非负整数秒
   实际起飞偏移 + 修订号**（首版 1、严格递增）上报；同号同值重试幂等，同号异值或
   旧号返回冲突。上报裁决在存储层用**数据库级条件写入**完成，**多个进程共用同一
   SQLite 文件并发上报时也不会发生修订回退**：高修订号先提交则低号得到带
@@ -283,25 +288,108 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
     或某个字典序坐标尚未完成证明（如优化阶段超时）；此时给出的偏移表一定可执行，只是不
     保证最优；
   - `infeasible`：可行性探测被证明**确实无解**，返回极小无解架次集合；
-  - `unknown`：时限内连可行性都未确定（无见证也无反证）。**超时永远不会覆盖已知可行
-    方案**：一次重算返回 `unknown` 时，若 SQLite 中已存有可行方案，则保留旧方案与
-    （重算请求未改变安全参数时）对应阈值，本次响应也回带该方案，页面照常渲染、执行批次
-    仍可从该方案创建；已冻结的批次不受任何重算影响。证明了 `infeasible` 的重算仍会正常
-    覆盖旧结果，从而保留“确实无解”这一信息。
+  - `unknown`：时限内连可行性都未确定（无见证也无反证）。**超时永远不会覆盖
+    SQLite 中已验证的可行表**，但也**不会把旧表冒充成本次重算的解**：重算始终把
+    **本次锁定与阈值**送入冲突约束和求解器，返回时顶层字段带回的就是本次阈值，
+    `solution` 明确为 `unknown`（页面据此提示“未验证”，不会误报成功）；旧可行表
+    通过独立字段 `prior_solution` 承载，内含旧表结果、**旧表原阈值**与原约束表，
+    页面把它作为虚线“旧表”轨迹保留查看并标明原约束，地图/时间轴仍可对照。
+    无旧表时 `prior_solution` 为 `null`。证明了 `infeasible` 的重算仍会正常
+    覆盖旧结果，新可行解也照常保存；普通（未超时）成功请求的响应字段与批次行为
+    完全保持兼容。
 
 ---
+
+## 重算超时（unknown）与旧表选用：字段承载与操作流程
+
+`POST /api/scenarios/{id}/solve` 每次都把**本次请求**的锁定（`locks`）与阈值
+（`safety_radius` / `safety_height`，缺省取库存值）送入冲突约束表与 CP-SAT。
+当本次求解在时限内既未找到可行表、也未证明无解（`status="unknown"`）时，两者
+分别承载、互不掩盖：
+
+| 内容 | 承载字段 | 含义 |
+| --- | --- | --- |
+| 本次状态 | `solution.status = "unknown"`、`solution.feasible = false`、`solution.locked` | 明确表明**未验证**，页面提示超时而非成功 |
+| 本次阈值/约束 | 顶层 `safety_radius` / `safety_height` / `pair_constraints`、`earliest_conflicts` | 本次锁定与新阈值下的约束与最早起飞冲突，页面输入框与锁定勾选保持不变 |
+| 旧验证表 | `prior_solution`（仅 solve 响应） | `{result, safety_radius, safety_height, pair_constraints}`：旧表及其**原阈值、原约束表**；无旧表时为 `null` |
+| SQLite | 不写入 | 旧表与原阈值原样保留；`GET /api/scenarios/{id}` 仍返回旧表（普通 `solution` 字段），响应不含 `prior_solution` |
+
+- 确证 `infeasible` 的重算**照常覆盖**旧结果；新可行解照常保存；普通成功请求的
+  响应字段与默认批次行为保持兼容。
+- 页面行为：结果面板标题为“求解超时”，列出**本次阈值与锁定**；若有旧表，则单独
+  卡片展示旧表起飞时刻与**旧表原阈值 R/H**，地图/时间轴/剖面图以虚线
+  **“旧表”轨迹**保留显示（图例同步标注“旧表轨迹（原阈值，本次未验证）”），
+  架次面板的偏移标签在该状态下显示“旧表偏移”。本次锁定勾选与 R/H 输入值不会被
+  旧值回填。
+- 创建批次：unknown 状态下普通“从当前方案创建执行批次”入口不会冻结旧约束，
+  需要点结果面板里的 **显式选用旧表（原阈值）创建批次**，确认提示中展示的旧表
+  原阈值后提交。HTTP 层等价于：
+
+```bash
+# 1) 先有一份已验证可行表（正常求解）
+curl -s -X POST http://localhost:8000/api/scenarios/1/solve \
+  -H 'Content-Type: application/json' -d '{"time_limit":20}'
+
+# 2) 新锁定/阈值下重算超时 -> solution=unknown，prior_solution 携带旧表与原阈值
+curl -s -X POST http://localhost:8000/api/scenarios/1/solve \
+  -H 'Content-Type: application/json' \
+  -d '{"time_limit":1,"safety_radius":55,"safety_height":22,
+       "locks":[{"sortie_id":"UAV-A","offset":7}]}'
+# => {"safety_radius":55.0,"safety_height":22.0,
+#     "solution":{"feasible":false,"status":"unknown","locked":{"UAV-A":7},...},
+#     "prior_solution":{"result":{"feasible":true,"status":"optimal",
+#                                 "offsets":{...}} ,
+#                       "safety_radius":30.0,"safety_height":10.0,
+#                       "pair_constraints":[...]}}
+
+# 3) 显式选用旧表：必须回显旧表原阈值；错误回显 -> 400 stored_threshold_mismatch
+curl -i -X POST http://localhost:8000/api/scenarios/1/batches \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"按旧表冻结","plan_source":"stored",
+       "stored_safety_radius":30,"stored_safety_height":10}'
+# HTTP/1.1 201 Created —— 批次冻结旧表偏移与 R=30/H=10
+```
+
+无旧表时第 2 步返回 `"prior_solution": null`，且任何批次创建都被 `400` 拒绝，
+直到出现新可行解或确证无解。
+
+### Docker Compose 一键启动并重算/选旧表
+
+本流程无需额外构建：
+
+```bash
+docker compose up --build        # 数据保存在命名卷 dcc-data（/data/console.db）
+```
+
+浏览器访问 <http://localhost:8000/>：
+
+1. 点 **载入示例**（或 **导入航迹 JSON**），点 **重算（应用锁定）** 得到可行表；
+2. 修改 **安全半径/安全高度** 或勾选若干 **锁定** 后再次 **重算**；
+3. 若返回超时（结果面板“⏳ 求解超时”）：本次锁定与阈值仍在页面上，旧可行表在
+   面板中单独显示并标注**原阈值**，地图上以虚线旧表轨迹保留；
+4. 需要据旧表执行时，点面板中的 **显式选用旧表（原阈值 R=…/H=…）创建批次**，
+   确认后批次即按旧表与原阈值冻结，在左侧批次列表打开即可上报与评估预警；
+5. 加大 **求解时限** 或解除部分锁定后重算，若得到可行解则旧表自动被新验证解
+   取代，页面恢复正常成功流程。
+
+API 健康检查：<http://localhost:8000/api/health>；停止用
+`docker compose down`（加 `-v` 同时清除数据卷）。
+
+---
+
+
 
 ## API 摘要
 
 | 方法 | 路径 | 作用 |
 | --- | --- | --- |
 | `POST` | `/api/import` | 导入航迹 JSON，返回架次/互斥时差/最早起飞冲突 |
-| `POST` | `/api/scenarios/{id}/solve` | 按（可覆盖的）安全参数与锁定重算 |
+| `POST` | `/api/scenarios/{id}/solve` | 按（可覆盖的）安全参数与锁定重算；unknown 时 `solution` 保持 unknown，旧验证表另由 `prior_solution`（含原阈值与原约束）承载 |
 | `POST` | `/api/scenarios/{id}/save` | 命名保存当前方案（含输入快照） |
 | `GET` | `/api/scenarios` | 已保存方案列表 |
-| `GET` | `/api/scenarios/{id}` | 回看某个方案（输入快照 + 求解结果） |
+| `GET` | `/api/scenarios/{id}` | 回看某个方案（输入快照 + 求解结果，无 `prior_solution` 字段） |
 | `DELETE` | `/api/scenarios/{id}` | 删除 |
-| `POST` | `/api/scenarios/{id}/batches` | 从可行方案创建执行批次（冻结快照/阈值/计划） |
+| `POST` | `/api/scenarios/{id}/batches` | 从可行方案创建执行批次；`plan_source=stored` 时须回显旧表原阈值，显式选用重算超时后保留的旧表 |
 | `GET` | `/api/batches?scenario_id=` | 批次列表（可按场景过滤） |
 | `GET` | `/api/batches/{id}` | 批次详情（冻结计划 + 全部上报） |
 | `DELETE` | `/api/batches/{id}` | 删除批次及其上报 |
@@ -770,7 +858,7 @@ pip install -r requirements.txt
 python tests/test_geometry_crossval.py     # 几何：解析法 vs 连续扫描 vs 密采样
 python tests/test_solver_bruteforce.py 2026  # 求解器：对照暴力枚举（含无解核极小性）
 python tests/test_solver_stages.py         # 分阶段见证/超时回退：UNKNOWN 不丢可行表、FEASIBLE 字典序轮不锁未证偏移、全 OPTIMAL 才 optimal、unknown≠infeasible
-python tests/test_solve_keeps_plan.py      # 路由/SQLite：超时 unknown 不覆盖已知可行方案且批次仍可创建；infeasible 证明照常落库
+python tests/test_solve_keeps_plan.py      # 路由/SQLite：unknown 不冒充成功、不覆盖旧表，旧表经 prior_solution（原阈值）承载，批次须显式 plan_source=stored 并回显原阈值；infeasible/新可行解照常落库
 python tests/test_batches_warning.py       # 批次：修订协议/多进程共库并发/预警分类与冲突/复盘节点与区间差分
 python tests/test_workzone_window.py       # 作业区：圆柱占用解析几何 vs 密采样/闭区间相切/逾期与拒绝/安全窗口
 ```
@@ -807,11 +895,16 @@ python tests/test_workzone_window.py       # 作业区：圆柱占用解析几�
 - 求解时限可在页面或请求中设置（默认 20 秒）。正常规模下加权延误优化通常
   很快即可得到 `optimal`；优化阶段超时时，先前已找到的无冲突起飞表作为 `feasible`
   返回并写入 SQLite，状态标明“可行但最优性未证完”；若连可行表都未找到则返回
-  `unknown`，且**不会覆盖数据库中已有的可行方案**（批次照常创建）。只有加权目标
+  `unknown`，此时**不写库、不回填旧阈值**：响应的 `solution` 保持 `unknown`，
+  旧验证表（若有）经 `prior_solution` 连同**原阈值与原约束表**单独返回、页面以
+  虚线旧表保留查看，创建执行批次必须显式 `plan_source="stored"` 并回显旧表原阈值；
+  无旧表时 `prior_solution` 为 `null`。只有加权目标
   与所有字典序轮次都被证明最优才标 `optimal`。
 - 执行批次只允许从**可行方案**创建；批次保存的是独立的输入/阈值/计划快照，
   场景的后续重算、改名或删除不影响已建批次的预警计算（删除场景会级联移除其
-  批次，依赖 SQLite 外键 `ON DELETE`）。
+  批次，依赖 SQLite 外键 `ON DELETE`）。重算 `unknown` 保留旧表后，普通
+  `current` 请求与页面入口不会静默冻结旧约束，须由 `plan_source="stored"`
+  并回显旧表原阈值显式选用（见上文“重算超时与旧表选用”）。
 - 预警的“计划起飞不早于 `t`”按 `计划偏移 >= t` 判定（恰在 `t` 起飞仍可预测）；
   逾期架次不参与任何冲突对，因此只要存在逾期架次 `incomplete=true`。已上报架次
   的偏离秒数 = 实际偏移 − 计划偏移（负为提前、正为延误）。

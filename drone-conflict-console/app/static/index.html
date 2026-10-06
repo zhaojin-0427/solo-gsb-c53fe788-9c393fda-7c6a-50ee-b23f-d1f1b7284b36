@@ -63,7 +63,7 @@
 
     <section class="card" id="batchCard">
       <h3>执行批次与偏差预警</h3>
-      <div class="hint">从当前可行方案创建执行批次：冻结输入航迹、安全阈值与计划偏移；之后对原方案重算不会改变批次。</div>
+      <div class="hint">从当前可行方案创建执行批次：冻结输入航迹、安全阈值与计划偏移；之后对原方案重算不会改变批次。重算返回 unknown（未证明可行也未证明无解）时，本次锁定与阈值保留在页面但不落库，旧可行表仍可查看；须在结果面板<strong>显式选用旧表及其原阈值</strong>才能据此建批次。</div>
       <div class="row" style="margin-bottom:8px">
         <button id="createBatchBtn" disabled>从当前方案创建执行批次</button>
       </div>

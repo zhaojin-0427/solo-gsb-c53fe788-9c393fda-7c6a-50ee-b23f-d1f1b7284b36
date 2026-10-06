@@ -74,6 +74,15 @@ class SaveRequest(BaseModel):
 
 class CreateBatchRequest(BaseModel):
     name: str = Field("", description="optional display name for the batch")
+    # By default the batch freezes the plan the last successful solve proved.
+    # "stored" explicitly chooses the *previously verified* plan kept in SQLite
+    # after an unverified re-solve (status unknown); its original safety
+    # thresholds must be echoed so the client proves it saw the old table's
+    # constraints rather than the just-attempted locks/thresholds.
+    plan_source: str = Field(
+        "current", description="current (the live solved plan) or stored (old verified plan)")
+    stored_safety_radius: float | None = Field(None, gt=0)
+    stored_safety_height: float | None = Field(None, gt=0)
 
 
 class ReportRequest(BaseModel):
