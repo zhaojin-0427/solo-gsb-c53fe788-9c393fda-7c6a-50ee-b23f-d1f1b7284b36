@@ -161,15 +161,17 @@ def solve_scenario(sid: int, req: SolveRequest):
     res = run_solve(sorties, pcs, locks, time_limit=req.time_limit)
 
     # A time-out that proved nothing must never destroy a previously proven
-    # feasible take-off table in SQLite: the re-solve response falls back to
-    # the stored plan (and its thresholds), batches created from it stay valid.
+    # feasible take-off table in SQLite.  But the response must still report
+    # THIS run honestly: ``solution`` carries the unknown status and the
+    # requested (new) thresholds/constraints, while the retained old table is
+    # exposed separately under ``prior_solution`` together with the original
+    # thresholds it was solved under.  The page therefore keeps the new
+    # locks/thresholds, marks the old table's original constraints, and only
+    # offers batch creation as an explicit "use the stored old table" choice.
     # A genuine infeasibility proof still replaces the stored result, and "no
     # prior solution" leaves the unknown status visible to the page/API.
     prior = row.get("result")
     keep_prior = res.status == "unknown" and bool(prior and prior.get("feasible"))
-    if keep_prior:
-        R, H = row["safety_radius"], row["safety_height"]
-        pcs = build_pair_constraints(sorties, R, H)
 
     earliest = scan_schedule(sorties, {s.id: 0 for s in sorties}, R, H)
     solved_conflicts = []
@@ -190,13 +192,23 @@ def solve_scenario(sid: int, req: SolveRequest):
         "truncated": res.truncated,
     }
     if keep_prior:
-        effective_result = prior
+        # SQLite keeps the previously proven table untouched; the response
+        # still reports this run as unknown and carries the retained table
+        # (annotated with its original thresholds) under a separate key.
+        effective_result = result
     else:
         store.save_result(sid, result, R, H)
         effective_result = result
-    return _scenario_summary(sid, sorties, R, H, pcs,
-                             solve_result=effective_result,
-                             earliest_conflicts=earliest)
+    out = _scenario_summary(sid, sorties, R, H, pcs,
+                            solve_result=effective_result,
+                            earliest_conflicts=earliest)
+    if keep_prior:
+        out["prior_solution"] = {
+            **prior,
+            "safety_radius": row["safety_radius"],
+            "safety_height": row["safety_height"],
+        }
+    return out
 
 
 @app.post("/api/scenarios/{sid}/save")
@@ -251,7 +263,12 @@ def create_batch(sid: int, req: CreateBatchRequest):
         raise HTTPException(
             400, "a feasible plan must be solved before creating an execution batch")
     # Freeze the input snapshot, safety thresholds and planned offsets; later
-    # re-solves of the scenario never mutate this batch.
+    # re-solves of the scenario never mutate this batch.  The batch always
+    # freezes the plan stored in SQLite; ``req.use_stored_plan`` is the
+    # client's explicit acknowledgment that it is deliberately selecting that
+    # stored (old) table with its original thresholds after a re-solve came
+    # back ``unknown`` (the page labels the action accordingly).  Behaviour is
+    # otherwise identical either way, keeping existing clients compatible.
     plan = {"offsets": dict(result["offsets"])}
     bid = store.create_batch(
         sid, req.name, row["input"], row["safety_radius"], row["safety_height"], plan)

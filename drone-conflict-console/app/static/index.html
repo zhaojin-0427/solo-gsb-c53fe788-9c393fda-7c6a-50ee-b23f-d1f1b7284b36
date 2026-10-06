@@ -63,7 +63,7 @@
 
     <section class="card" id="batchCard">
       <h3>执行批次与偏差预警</h3>
-      <div class="hint">从当前可行方案创建执行批次：冻结输入航迹、安全阈值与计划偏移；之后对原方案重算不会改变批次。</div>
+      <div class="hint">从当前可行方案创建执行批次：冻结输入航迹、安全阈值与计划偏移；之后对原方案重算不会改变批次。若重算超时（unknown），本次新约束未经验证，按钮会变成“选用已保存旧表创建批次（原阈值…）”——只有显式选择才会用 SQLite 中保留的旧表及其原阈值冻结批次。</div>
       <div class="row" style="margin-bottom:8px">
         <button id="createBatchBtn" disabled>从当前方案创建执行批次</button>
       </div>

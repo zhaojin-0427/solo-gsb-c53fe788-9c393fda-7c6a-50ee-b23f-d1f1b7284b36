@@ -74,6 +74,14 @@ class SaveRequest(BaseModel):
 
 class CreateBatchRequest(BaseModel):
     name: str = Field("", description="optional display name for the batch")
+    use_stored_plan: bool = Field(
+        False,
+        description="explicit acknowledgment that the batch freezes the plan "
+                    "currently stored in SQLite (the retained old table with "
+                    "its original thresholds) rather than a freshly verified "
+                    "solve; sent by the page when the latest re-solve returned "
+                    "unknown and the user deliberately selects the old table",
+    )
 
 
 class ReportRequest(BaseModel):

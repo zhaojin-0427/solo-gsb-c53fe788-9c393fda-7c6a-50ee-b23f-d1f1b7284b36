@@ -12,7 +12,8 @@ const state = {
   sorties: [],
   pairConstraints: [],
   earliestConflicts: [],
-  solution: null,
+  solution: null,        // THIS run's solve result (may be status "unknown")
+  priorSolution: null,   // retained old table (original thresholds) after an unknown re-solve
   history: [],
   locks: {},             // sortieId -> offset (only when checked)
   time: 0,
@@ -78,7 +79,10 @@ function loadScenarioDto(dto) {
   state.pairConstraints = dto.pair_constraints || [];
   state.earliestConflicts = dto.earliest_conflicts || [];
   state.solution = dto.solution || null;
-  state.locks = {};
+  state.priorSolution = dto.prior_solution || null;
+  // Keep the locks this run actually applied (they stay checked after a
+  // re-solve — in particular after an unknown one — instead of vanishing).
+  state.locks = { ...((state.solution && state.solution.locked) || {}) };
   state.colorsById = {};
   state.batch = null;
   state.warning = null;
@@ -87,10 +91,12 @@ function loadScenarioDto(dto) {
   state.reviewNodes = [];
   state.workzone = null;
   state.sorties.forEach((s) => colorFor(s.id));
+  // The solve response echoes THIS run's thresholds, so the inputs keep the
+  // values just requested even when the run timed out (unknown).
   $("safetyRadius").value = dto.safety_radius;
   $("safetyHeight").value = dto.safety_height;
   $("newSolveBtn").disabled = false;
-  $("createBatchBtn").disabled = !(state.solution && state.solution.feasible);
+  updateCreateBatchBtn();
   $("savePlanBtn").disabled = !(state.solution && state.solution.feasible);
   updateMaxTime();
   state.time = 0;
@@ -98,6 +104,40 @@ function loadScenarioDto(dto) {
   renderResultPanel();
   renderSortiePanel();
   fetchBatches();
+}
+
+// The schedule the page draws: this run's table when feasible, otherwise the
+// retained old table (so an unknown re-solve never makes it vanish) — always
+// marked as such wherever it is shown.
+function displayedSolution() {
+  if (state.solution && state.solution.feasible) return state.solution;
+  if (state.priorSolution && state.priorSolution.feasible) return state.priorSolution;
+  return null;
+}
+
+function usingPriorTable() {
+  return !(state.solution && state.solution.feasible) &&
+    !!(state.priorSolution && state.priorSolution.feasible);
+}
+
+function updateCreateBatchBtn() {
+  const btn = $("createBatchBtn");
+  if (state.solution && state.solution.feasible) {
+    btn.disabled = false;
+    btn.textContent = "从当前方案创建执行批次";
+    btn.title = "冻结本次求解得到的起飞表与当前安全阈值";
+  } else if (usingPriorTable()) {
+    // Explicit old-table selection: the new constraints were NOT verified
+    // (unknown), so the action names the old table and its original
+    // thresholds instead of pretending the current run succeeded.
+    btn.disabled = false;
+    btn.textContent = `选用已保存旧表创建批次（原阈值 R=${state.priorSolution.safety_radius} / H=${state.priorSolution.safety_height}）`;
+    btn.title = "本次重算未验证新约束（unknown）；显式选用 SQLite 中保留的旧表及其原阈值冻结为批次";
+  } else {
+    btn.disabled = true;
+    btn.textContent = "从当前方案创建执行批次";
+    btn.title = "";
+  }
 }
 
 async function fetchHistory() {
@@ -124,7 +164,9 @@ async function solve(extraLocks) {
     renderAll();
     if (dto.solution.feasible) toast("求解成功，已生成无冲突起飞时刻");
     else if (dto.solution.status === "unknown") {
-      toast("求解超时：暂未找到可行表，也未证明无解；已有方案保持不变", 4200);
+      toast(dto.prior_solution
+        ? "本次求解超时（unknown）：新锁定/阈值未经验证；下方仍展示已保留的旧表（原阈值），可显式选用它创建批次"
+        : "求解超时：暂未找到可行表，也未证明无解；已有方案保持不变", 4600);
     } else toast("当前条件无解，已列出极小无解架次集合", 4000);
   } catch (e) {
     toast("求解失败：" + e.message, 4200);
@@ -180,8 +222,9 @@ function updateMaxTime() {
 
 function currentOffsets() {
   const o = {};
+  const shown = displayedSolution();
   for (const s of state.sorties) {
-    o[s.id] = state.solution && state.solution.feasible ? (state.solution.offsets[s.id] ?? 0) : 0;
+    o[s.id] = shown ? (shown.offsets[s.id] ?? 0) : 0;
   }
   return o;
 }
@@ -193,7 +236,9 @@ function currentOffsets() {
 function renderSortiePanel() {
   const box = $("sortiesList");
   box.innerHTML = "";
-  const solvedOff = state.solution && state.solution.feasible ? state.solution.offsets : null;
+  const shown = displayedSolution();
+  const solvedOff = shown ? shown.offsets : null;
+  const stale = usingPriorTable();
   for (const s of state.sorties) {
     const c = colorFor(s.id);
     const div = document.createElement("div");
@@ -207,7 +252,7 @@ function renderSortiePanel() {
         <span class="si-meta">w=${s.weight} · 窗[0,${s.window_hi}] · 长${s.flight_end}s</span>
       </div>
       <div class="si-body">
-        <span class="${solvedOff ? "solved-tag" : ""}">求解偏移: <b>${solvedOff ? solvedOff[s.id] : "—"}</b></span>
+        <span class="${solvedOff ? "solved-tag" : ""}">${stale ? "旧表偏移" : "求解偏移"}: <b>${solvedOff ? solvedOff[s.id] : "—"}</b></span>
         <label class="lock-wrap">
           <input type="checkbox" ${locked ? "checked" : ""} data-lock-check="${s.id}" />
           锁定
@@ -282,13 +327,34 @@ function renderResultPanel() {
   }
   panel.classList.remove("hidden");
   if (sol.status === "unknown") {
-    title.textContent = "⏳ 求解超时 — 可行与无解均未证明";
-    body.innerHTML = `
-      <div class="kv bad"><span>状态</span><b>${sol.status}</b></div>
+    title.textContent = "⏳ 本次求解超时 — 可行与无解均未证明（unknown）";
+    const prior = state.priorSolution && state.priorSolution.feasible
+      ? state.priorSolution : null;
+    let html = `
+      <div class="kv bad"><span>本次状态</span><b>${sol.status}</b></div>
       <div class="hint" style="margin-top:6px">
         在给定时限内 CP-SAT 既没有找到可行起飞表，也没有证明无解。这与“确实无解”不同：
-        可加大求解时限后重试。若此前已保存过可行方案，该方案仍保留在 SQLite 中，
-        已建执行批次不受影响。</div>`;
+        本次送入的锁定与安全阈值（R=${state.scenario.safety_radius}m / H=${state.scenario.safety_height}m）
+        <b>未经验证</b>，已保留在左侧输入中，可加大求解时限后点“重算”重试。</div>`;
+    if (prior) {
+      const seq = Object.keys(prior.offsets).sort()
+        .map((k) => `${escapeHtml(k)}=${prior.offsets[k]}`).join("，");
+      html += `
+      <div class="prior-box">
+        <div class="prior-title">📦 已保留的旧表（SQLite 中的上一可行方案，未受本次重算影响）</div>
+        <div class="kv"><span>旧表原约束</span><b>R=${prior.safety_radius}m / H=${prior.safety_height}m</b></div>
+        <div class="kv"><span>旧表状态</span><b>${prior.status}</b></div>
+        <div class="kv"><span>加权总延误 Σw·d</span><b>${prior.weighted_delay}</b></div>
+        <div class="conf-line" style="margin-top:6px">旧表起飞时刻（秒）：</div>
+        <div style="margin-top:2px">${seq}</div>
+        <div class="hint" style="margin-top:6px">地图/时间轴中的实线仍是该旧表；
+          如需用它冻结执行批次，请在“执行批次”卡片点
+          <b>“选用已保存旧表创建批次”</b>（将沿用旧表原阈值）。</div>
+      </div>`;
+    } else {
+      html += `<div class="hint" style="margin-top:6px">当前没有可回退的已保存可行方案；已建执行批次不受影响。</div>`;
+    }
+    body.innerHTML = html;
   } else if (!sol.feasible) {
     title.textContent = "⚠️ 无解 — 极小无解架次集合";
     let html = `<div class="kv bad"><span>状态</span><b>${sol.status}</b></div>`;
@@ -464,7 +530,8 @@ function renderMap() {
 
   const showE = $("showEarliest").checked;
   const showS = $("showSolved").checked;
-  const solvedOff = state.solution && state.solution.feasible ? state.solution.offsets : null;
+  const shown = displayedSolution();
+  const solvedOff = shown ? shown.offsets : null;
 
   for (const s of state.sorties) {
     if (showE) drawTrack(ctx, proj, s, 0, true, state.time);
@@ -495,7 +562,8 @@ function renderTimeline() {
   ctx.clearRect(0, 0, w, h);
   if (!state.sorties.length) return;
   const g = timelineGeometry(w, h);
-  const solvedOff = state.solution && state.solution.feasible ? state.solution.offsets : null;
+  const shownT = displayedSolution();
+  const solvedOff = shownT ? shownT.offsets : null;
 
   // grid + axis
   ctx.strokeStyle = "#243049"; ctx.fillStyle = "#8092b5"; ctx.font = "10px monospace";
@@ -588,7 +656,8 @@ function renderProfile() {
     ctx.fillText(`${z}m`, 6, y + 3);
   }
 
-  const solvedOff = state.solution && state.solution.feasible ? state.solution.offsets : null;
+  const shownP = displayedSolution();
+  const solvedOff = shownP ? shownP.offsets : null;
   for (const s of state.sorties) {
     const c = colorFor(s.id);
     if ($("showEarliest").checked) {
@@ -636,6 +705,13 @@ function renderLegend() {
   cf.className = "lg";
   cf.innerHTML = `<span style="color:#ff5d6c">✕</span> 冲突见证点（最早起飞）`;
   box.appendChild(cf);
+  if (usingPriorTable()) {
+    const p = state.priorSolution;
+    const note = document.createElement("span");
+    note.className = "lg";
+    note.innerHTML = `<span style="color:#ffb020">▬</span> 实线为已保留旧表（原阈值 R=${p.safety_radius}m / H=${p.safety_height}m），本次重算 unknown`;
+    box.appendChild(note);
+  }
 }
 
 function renderAll() {
@@ -679,14 +755,31 @@ function nextRevision(sortieId) {
 
 async function createBatch() {
   if (!state.scenarioId) return;
+  // After an unknown re-solve the only freezable plan is the retained old
+  // table; selecting it must be an explicit, informed choice (the new locks/
+  // thresholds were never verified).
+  const prior = usingPriorTable() ? state.priorSolution : null;
+  if (prior) {
+    const seq = Object.keys(prior.offsets).sort()
+      .map((k) => `${k}=${prior.offsets[k]}`).join("，");
+    const ok = confirm(
+      "本次重算返回 unknown，新锁定/阈值未经验证。\n\n" +
+      "将显式选用 SQLite 中保留的旧表创建执行批次：\n" +
+      `· 旧表起飞时刻（秒）：${seq}\n` +
+      `· 旧表原阈值：R=${prior.safety_radius}m / H=${prior.safety_height}m\n\n` +
+      "确定选用旧表及原阈值冻结为批次？");
+    if (!ok) return;
+  }
   const name = prompt("为执行批次命名（可留空）：", `批次 #${state.scenarioId}`);
   if (name === null) return;
   try {
     const b = await api(`/api/scenarios/${state.scenarioId}/batches`, {
       method: "POST",
-      body: JSON.stringify({ name }),
+      body: JSON.stringify({ name, use_stored_plan: !!prior }),
     });
-    toast("已创建执行批次（输入航迹 / 安全阈值 / 计划偏移已冻结）");
+    toast(prior
+      ? "已用已保存旧表（原阈值）创建执行批次"
+      : "已创建执行批次（输入航迹 / 安全阈值 / 计划偏移已冻结）");
     await fetchBatches();
     await openBatch(b.batch_id);
   } catch (e) {
